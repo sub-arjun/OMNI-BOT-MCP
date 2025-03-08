@@ -4,6 +4,8 @@ A simple Slack bot that uses the Model Context Protocol (MCP) to enhance its cap
 
 ## Features
 
+![2025-03-08-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/0e2b6e1c-80f2-48c3-8ca4-1c41f3678478)
+
 - **AI-Powered Assistant**: Responds to messages in channels and DMs using LLM capabilities
 - **MCP Integration**: Full access to MCP tools like SQLite database and web fetching
 - **Multi-LLM Support**: Works with OpenAI, Groq, and Anthropic models
