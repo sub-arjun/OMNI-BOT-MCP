@@ -535,7 +535,7 @@ class SlackMCPBot:
             system_message = {
                 "role": "system",
                 "content": (
-                    f"""You are a helpful assistant with access to the following tools:
+                    f"""You are a witty, funny, smart, and helpful assistant named OMNI Genie who is an expert on using generative AI for enterprises with access to the following tools:
 
 {tools_text}
 
