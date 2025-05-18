@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+import re # Added for command parsing
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List
 
@@ -13,6 +14,8 @@ from mcp.client.stdio import stdio_client
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
+
+from .llama_index_agent import LlamaIndexRAGAgent # Added LlamaIndex import
 
 # Configure logging
 logging.basicConfig(
@@ -32,6 +35,7 @@ class Configuration:
         self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.llm_model = os.getenv("LLM_MODEL", "gpt-4-turbo")
+        self.agent_mode = os.getenv("AGENT_MODE", "mcp").lower() # Added agent_mode
 
     @staticmethod
     def load_env() -> None:
@@ -394,52 +398,88 @@ class LLMClient:
 
 
 class SlackMCPBot:
-    """Manages the Slack bot integration with MCP servers."""
+    """Main class for the Slack bot, handling MCP interactions and LLM communication."""
 
     def __init__(
         self,
-        slack_bot_token: str,
-        slack_app_token: str,
+        config: Configuration, # Changed to accept Configuration object
         servers: List[Server],
         llm_client: LLMClient,
     ) -> None:
-        self.app = AsyncApp(token=slack_bot_token)
-        # Create a socket mode handler with the app token
-        self.socket_mode_handler = AsyncSocketModeHandler(self.app, slack_app_token)
+        """Initialize the Slack bot.
 
-        self.client = AsyncWebClient(token=slack_bot_token)
-        self.servers = servers
-        self.llm_client = llm_client
-        self.conversations = {}  # Store conversation context per channel
-        self.tools = []
+        Args:
+            config: The application configuration object.
+            servers: List of MCP servers.
+            llm_client: Client for LLM communication.
+        """
+        self.config = config # Store config
+        self.app = AsyncApp(token=self.config.slack_bot_token)
+        self.socket_mode_handler: AsyncSocketModeHandler | None = None
+        self.servers: List[Server] = servers
+        self.tools: List[Tool] = []
+        self.llm_client: LLMClient = llm_client
+        self.bot_user_id: str | None = None
+        self.history: Dict[str, List[Dict[str, str]]] = {}
 
-        # Set up event handlers
+        self.llama_agent: LlamaIndexRAGAgent | None = None
+        if self.config.agent_mode == "llama_index":
+            logging.info("Agent mode: llama_index. Initializing LlamaIndexRAGAgent.")
+            if not self.config.anthropic_api_key:
+                logging.error("ANTHROPIC_API_KEY is required for LlamaIndex agent with Anthropic.")
+                # Potentially raise an error or prevent startup
+            elif not self.config.openai_api_key: # LlamaIndex agent uses this for embeddings by default
+                logging.error("OPENAI_API_KEY is required for LlamaIndex agent embeddings.")
+            else:
+                try:
+                    self.llama_agent = LlamaIndexRAGAgent(
+                        anthropic_api_key=self.config.anthropic_api_key,
+                        anthropic_model_name=self.config.llm_model, # Use the configured LLM model
+                        openai_api_key=self.config.openai_api_key
+                    )
+                    logging.info("LlamaIndexRAGAgent initialized successfully.")
+                except Exception as e:
+                    logging.error(f"Failed to initialize LlamaIndexRAGAgent: {e}")
+                    # Bot might start without LlamaIndex agent functionality in this case.
+                    # Or, raise an error to prevent startup if LlamaIndex mode is critical.
+        elif self.config.agent_mode == "mcp":
+            logging.info("Agent mode: mcp.")
+        else:
+            logging.warning(f"Unknown agent mode: {self.config.agent_mode}. Defaulting to mcp-like behavior if possible or LlamaIndex if MCP fails.")
+
+
         self.app.event("app_mention")(self.handle_mention)
-        self.app.message()(self.handle_message)
+        self.app.event("message")(self.handle_message)
         self.app.event("app_home_opened")(self.handle_home_opened)
 
     async def initialize_servers(self) -> None:
-        """Initialize all MCP servers and discover tools."""
-        for server in self.servers:
-            try:
-                await server.initialize()
-                server_tools = await server.list_tools()
-                self.tools.extend(server_tools)
-                logging.info(
-                    f"Initialized server {server.name} with {len(server_tools)} tools"
-                )
-            except Exception as e:
-                logging.error(f"Failed to initialize server {server.name}: {e}")
+        """Initialize all MCP servers and populate tools if in MCP mode."""
+        if self.config.agent_mode == "mcp":
+            tool_tasks = [server.initialize() for server in self.servers]
+            await asyncio.gather(*tool_tasks, return_exceptions=True)
+
+            all_tools = []
+            for server in self.servers:
+                if server.session:  # Check if server was initialized successfully
+                    try:
+                        tools = await server.list_tools()
+                        all_tools.extend(tools)
+                    except Exception as e:
+                        logging.error(f"Error listing tools for server {server.name}: {e}")
+            self.tools = all_tools
+            logging.info(f"Initialized {len(self.tools)} tools from MCP servers.")
+        else:
+            logging.info("Skipping MCP server initialization in llama_index mode.")
 
     async def initialize_bot_info(self) -> None:
         """Get the bot's ID and other info."""
         try:
             auth_info = await self.client.auth_test()
-            self.bot_id = auth_info["user_id"]
-            logging.info(f"Bot initialized with ID: {self.bot_id}")
+            self.bot_user_id = auth_info["user_id"]
+            logging.info(f"Bot initialized with ID: {self.bot_user_id}")
         except Exception as e:
             logging.error(f"Failed to get bot info: {e}")
-            self.bot_id = None
+            self.bot_user_id = None
 
     async def handle_mention(self, event, say):
         """Handle mentions of the bot in channels."""
@@ -510,78 +550,99 @@ class SlackMCPBot:
             logging.error(f"Error publishing home view: {e}")
 
     async def _process_message(self, event, say):
-        """Process incoming messages and generate responses."""
-        channel = event["channel"]
-        user_id = event.get("user")
+        """Core logic for processing incoming messages (mentions or DMs)."""
+        channel_id = event["channel"]
+        user_id = event["user"]
+        message_text = event["text"]
+        thread_ts = event.get("thread_ts") or event["ts"]
 
-        # Skip messages from the bot itself
-        if user_id == getattr(self, "bot_id", None):
+        # Clean message text (remove bot mention if present)
+        if self.bot_user_id:
+            message_text = message_text.replace(f"<@{self.bot_user_id}>", "").strip()
+
+        logging.info(
+            f"Processing message: '{message_text}' from user {user_id} in channel {channel_id}"
+        )
+
+        # LlamaIndex Agent Mode
+        if self.config.agent_mode == "llama_index" and self.llama_agent:
+            response_text = ""
+            try:
+                # Command to load a file
+                load_file_match = re.match(r"load file\s+(.+)", message_text, re.IGNORECASE)
+                if load_file_match:
+                    filename = load_file_match.group(1).strip()
+                    # Basic security: prevent path traversal. LlamaIndexAgent joins with DOCUMENTS_DIR.
+                    if ".." in filename or "/" in filename or "\\\\" in filename:
+                         response_text = "Error: Invalid filename. Please provide a filename without path components."
+                    else:
+                        logging.info(f"LlamaIndex mode: Received command to load file: {filename}")
+                        response_text = await self.llama_agent.add_file_to_index(filename)
+                else:
+                    # Regular query
+                    logging.info(f"LlamaIndex mode: Querying agent with: {message_text}")
+                    response_text = await self.llama_agent.query(message_text)
+                
+                if not response_text: # Handle cases where agent might return None or empty
+                    response_text = "I received your message, but I don't have a specific response for that."
+
+            except Exception as e:
+                logging.error(f"Error in LlamaIndex agent processing: {e}")
+                response_text = f"Sorry, I encountered an error while using the LlamaIndex agent: {e}"
+            
+            await say(text=response_text, thread_ts=thread_ts)
             return
 
-        # Get text and remove bot mention if present
-        text = event.get("text", "")
-        if hasattr(self, "bot_id") and self.bot_id:
-            text = text.replace(f"<@{self.bot_id}>", "").strip()
+        # MCP Mode (existing logic)
+        if self.config.agent_mode == "mcp":
+            # Update history
+            if channel_id not in self.history:
+                self.history[channel_id] = []
+            self.history[channel_id].append({"role": "user", "content": message_text})
 
-        thread_ts = event.get("thread_ts", event.get("ts"))
+            try:
+                # Create system message with tool descriptions
+                tools_text = "\n".join([tool.format_for_llm() for tool in self.tools])
+                # Read system prompt from file
+                try:
+                    with open("mcp_simple_slackbot/system_prompt.txt", "r") as f:
+                        prompt_template = f.read()
+                    system_prompt_content = prompt_template.format(tools_text=tools_text)
+                except FileNotFoundError:
+                    logging.error("System prompt file not found. Using default prompt.")
+                    # Fallback to a default prompt if file is missing, though it should be there
+                    system_prompt_content = f"""You are a helpful assistant with access to the following tools:\n\n{tools_text}\n\nUse tools when appropriate."""
+                
+                system_message = {
+                    "role": "system",
+                    "content": system_prompt_content,
+                }
+                
+                current_conversation = [system_message] + self.history[channel_id][-10:] # Keep last 10 interactions + system
 
-        # Get or create conversation context
-        if channel not in self.conversations:
-            self.conversations[channel] = {"messages": []}
+                response = await self.llm_client.get_response(current_conversation)
+                self.history[channel_id].append({"role": "assistant", "content": response})
 
-        try:
-            # Create system message with tool descriptions
-            tools_text = "\n".join([tool.format_for_llm() for tool in self.tools])
-            system_message = {
-                "role": "system",
-                "content": (
-                    f"""You are a witty, funny, smart, and helpful assistant named OMNI Genie who is an expert on using generative AI for enterprises with access to the following tools:
+                if "[TOOL]" in response:
+                    response = await self._process_tool_call(response, channel_id)
 
-{tools_text}
+                await say(text=response, thread_ts=thread_ts)
 
-When you need to use a tool, you MUST format your response exactly like this:
-[TOOL] tool_name
-{{"param1": "value1", "param2": "value2"}}
+            except httpx.HTTPStatusError as e:
+                logging.error(f"HTTP error calling LLM: {e.response.text}")
+                await say(
+                    text=f"Error calling LLM: {e.response.status_code}",
+                    thread_ts=thread_ts,
+                )
+            except Exception as e:
+                logging.error(f"Error processing message: {e}")
+                await say(text=f"An error occurred: {e}", thread_ts=thread_ts)
+            return # Ensure we don't fall through if in MCP mode
 
-Make sure to include both the tool name AND the JSON arguments.
-Never leave out the JSON arguments.
-
-After receiving tool results, interpret them for the user in a helpful way.
-"""
-                ),
-            }
-
-            # Add user message to history
-            self.conversations[channel]["messages"].append(
-                {"role": "user", "content": text}
-            )
-
-            # Set up messages for LLM
-            messages = [system_message]
-
-            # Add conversation history (last 5 messages)
-            if "messages" in self.conversations[channel]:
-                messages.extend(self.conversations[channel]["messages"][-5:])
-
-            # Get LLM response
-            response = await self.llm_client.get_response(messages)
-
-            # Process tool calls in the response
-            if "[TOOL]" in response:
-                response = await self._process_tool_call(response, channel)
-
-            # Add assistant response to conversation history
-            self.conversations[channel]["messages"].append(
-                {"role": "assistant", "content": response}
-            )
-
-            # Send the response to the user
-            await say(text=response, channel=channel, thread_ts=thread_ts)
-
-        except Exception as e:
-            error_message = f"I'm sorry, I encountered an error: {str(e)}"
-            logging.error(f"Error processing message: {e}", exc_info=True)
-            await say(text=error_message, channel=channel, thread_ts=thread_ts)
+        # Fallback if agent_mode is not recognized or Llama agent not initialized
+        # This part might need adjustment based on desired behavior for unknown modes.
+        logging.warning(f"Agent mode '{self.config.agent_mode}' not fully handled or LlamaIndex agent not available. Defaulting to simple echo or error.")
+        await say(text=f"Received: {message_text}. (Agent mode: {self.config.agent_mode}, Llama Agent: {'Yes' if self.llama_agent else 'No'})", thread_ts=thread_ts)
 
     async def _process_tool_call(self, response: str, channel: str) -> str:
         """Process a tool call from the LLM response."""
@@ -618,7 +679,7 @@ After receiving tool results, interpret them for the user in a helpful way.
 
                     # Add tool result to conversation history
                     tool_result_msg = f"Tool result for {tool_name}:\n{tool_result}"
-                    self.conversations[channel]["messages"].append(
+                    self.history[channel].append(
                         {"role": "system", "content": tool_result_msg}
                     )
 
@@ -681,6 +742,7 @@ After receiving tool results, interpret them for the user in a helpful way.
         await self.initialize_bot_info()
         # Start the socket mode handler
         logging.info("Starting Slack bot...")
+        self.socket_mode_handler = AsyncSocketModeHandler(self.app, self.config.slack_app_token)
         asyncio.create_task(self.socket_mode_handler.start_async())
         logging.info("Slack bot started and waiting for messages")
 
@@ -703,38 +765,60 @@ After receiving tool results, interpret them for the user in a helpful way.
 
 
 async def main() -> None:
-    """Initialize and run the Slack bot."""
-    config = Configuration()
+    """Main entry point for the bot."""
+    config = Configuration() # Initialize configuration
 
     if not config.slack_bot_token or not config.slack_app_token:
-        raise ValueError(
-            "SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in environment variables"
+        logging.error(
+            "SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set. Bot cannot start."
         )
+        return
 
-    server_config = config.load_config("servers_config.json")
-    servers = [
-        Server(name, srv_config)
-        for name, srv_config in server_config["mcpServers"].items()
-    ]
-
-    llm_client = LLMClient(config.llm_api_key, config.llm_model)
-
-    slack_bot = SlackMCPBot(
-        config.slack_bot_token, config.slack_app_token, servers, llm_client
-    )
-
+    # Load MCP server configurations
     try:
-        await slack_bot.start()
-        # Keep the main task alive until interrupted
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logging.info("Shutting down...")
-    except Exception as e:
-        logging.error(f"Error: {e}")
+        server_configs_data = config.load_config("mcp_simple_slackbot/servers_config.json")
+        mcp_servers_config = server_configs_data.get("mcpServers", {})
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logging.error(f"Error loading or parsing server_configs.json: {e}. MCP features may be limited.")
+        mcp_servers_config = {}
+
+
+    servers = []
+    if config.agent_mode == "mcp": # Only setup MCP servers if in MCP mode
+        for name, server_config in mcp_servers_config.items():
+            servers.append(Server(name, server_config))
+    
+    llm_client = LLMClient(api_key=config.llm_api_key, model=config.llm_model)
+
+    bot = SlackMCPBot(
+        config=config, # Pass the full config object
+        servers=servers, 
+        llm_client=llm_client
+    )
+    await bot.initialize_bot_info() # Important to get bot_user_id
+
+    # Initialize servers and tools (MCP mode) or LlamaIndex agent (LlamaIndex mode)
+    # LlamaIndex agent is initialized in SlackMCPBot.__init__
+    # MCP servers are initialized here if in MCP mode
+    if config.agent_mode == "mcp":
+        await bot.initialize_servers()
+    elif config.agent_mode == "llama_index" and bot.llama_agent is None:
+        logging.error("LlamaIndex agent mode selected, but agent failed to initialize. Bot may not function as expected.")
+        # Decide if bot should stop or continue with limited functionality
+        # For now, it will continue, but queries to LlamaIndex agent will fail.
+
+    logging.info(f"Bot starting in {config.agent_mode} mode...")
+    
+    try:
+        await bot.start()
     finally:
-        await slack_bot.cleanup()
+        await bot.cleanup() # Ensure cleanup is called
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user.")
+    except Exception as e:
+        logging.critical(f"Unhandled exception in main: {e}", exc_info=True)
