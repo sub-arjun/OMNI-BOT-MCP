@@ -415,6 +415,7 @@ class SlackMCPBot:
         """
         self.config = config # Store config
         self.app = AsyncApp(token=self.config.slack_bot_token)
+        self.client = AsyncWebClient(token=self.config.slack_bot_token) # Added missing client initialization
         self.socket_mode_handler: AsyncSocketModeHandler | None = None
         self.servers: List[Server] = servers
         self.tools: List[Tool] = []
@@ -776,7 +777,8 @@ async def main() -> None:
 
     # Load MCP server configurations
     try:
-        server_configs_data = config.load_config("mcp_simple_slackbot/servers_config.json")
+        # Corrected path: assuming servers_config.json is in the same directory as main.py
+        server_configs_data = config.load_config("servers_config.json") 
         mcp_servers_config = server_configs_data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logging.error(f"Error loading or parsing server_configs.json: {e}. MCP features may be limited.")
