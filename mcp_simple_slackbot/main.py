@@ -738,14 +738,22 @@ class SlackMCPBot:
             )
 
     async def start(self) -> None:
-        """Start the Slack bot."""
-        await self.initialize_servers()
+        """Start the Slack bot's socket mode handler and server initializations."""
+        # Initialize servers and bot info before starting the handler
+        if self.config.agent_mode == "mcp":
+            await self.initialize_servers()
+        elif self.config.agent_mode == "llama_index" and self.llama_agent is None:
+            logging.error("LlamaIndex agent mode selected, but agent failed to initialize. Bot may not function as expected.")
+        
         await self.initialize_bot_info()
-        # Start the socket mode handler
-        logging.info("Starting Slack bot...")
+        
+        logging.info(f"Bot starting in {self.config.agent_mode} mode...")
+        if not self.config.slack_app_token:
+            logging.error("SLACK_APP_TOKEN is not set. Cannot start SocketModeHandler.")
+            return
+
         self.socket_mode_handler = AsyncSocketModeHandler(self.app, self.config.slack_app_token)
-        asyncio.create_task(self.socket_mode_handler.start_async())
-        logging.info("Slack bot started and waiting for messages")
+        await self.socket_mode_handler.start_async() # This will run indefinitely
 
     async def cleanup(self) -> None:
         """Clean up resources."""
@@ -775,46 +783,39 @@ async def main() -> None:
         )
         return
 
-    # Load MCP server configurations
     try:
-        # Corrected path: assuming servers_config.json is in the same directory as main.py
         server_configs_data = config.load_config("servers_config.json") 
         mcp_servers_config = server_configs_data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logging.error(f"Error loading or parsing server_configs.json: {e}. MCP features may be limited.")
         mcp_servers_config = {}
 
-
     servers = []
-    if config.agent_mode == "mcp": # Only setup MCP servers if in MCP mode
+    if config.agent_mode == "mcp": 
         for name, server_config in mcp_servers_config.items():
             servers.append(Server(name, server_config))
     
     llm_client = LLMClient(api_key=config.llm_api_key, model=config.llm_model)
 
     bot = SlackMCPBot(
-        config=config, # Pass the full config object
+        config=config, 
         servers=servers, 
         llm_client=llm_client
     )
-    await bot.initialize_bot_info() # Important to get bot_user_id
+    # Note: Initialization logic is now moved into bot.start()
+    # await bot.initialize_bot_info() 
+    # if config.agent_mode == "mcp":
+    #     await bot.initialize_servers()
+    # elif config.agent_mode == "llama_index" and bot.llama_agent is None:
+    #     logging.error("LlamaIndex agent mode selected, but agent failed to initialize. Bot may not function as expected.")
 
-    # Initialize servers and tools (MCP mode) or LlamaIndex agent (LlamaIndex mode)
-    # LlamaIndex agent is initialized in SlackMCPBot.__init__
-    # MCP servers are initialized here if in MCP mode
-    if config.agent_mode == "mcp":
-        await bot.initialize_servers()
-    elif config.agent_mode == "llama_index" and bot.llama_agent is None:
-        logging.error("LlamaIndex agent mode selected, but agent failed to initialize. Bot may not function as expected.")
-        # Decide if bot should stop or continue with limited functionality
-        # For now, it will continue, but queries to LlamaIndex agent will fail.
-
-    logging.info(f"Bot starting in {config.agent_mode} mode...")
+    # logging.info(f"Bot starting in {config.agent_mode} mode...") # Moved to bot.start()
     
     try:
-        await bot.start()
+        await bot.start() # This now blocks until the bot stops
     finally:
-        await bot.cleanup() # Ensure cleanup is called
+        logging.info("Bot is shutting down, performing cleanup...")
+        await bot.cleanup()
 
 
 if __name__ == "__main__":
