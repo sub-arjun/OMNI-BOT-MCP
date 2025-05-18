@@ -606,7 +606,7 @@ class SlackMCPBot:
                 tools_text = "\n".join([tool.format_for_llm() for tool in self.tools])
                 # Read system prompt from file
                 try:
-                    with open("mcp_simple_slackbot/system_prompt.txt", "r") as f:
+                    with open("system_prompt.txt", "r") as f:
                         prompt_template = f.read()
                     system_prompt_content = prompt_template.format(tools_text=tools_text)
                 except FileNotFoundError:
