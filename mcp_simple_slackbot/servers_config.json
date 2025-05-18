@@ -1,9 +1,4 @@
 {
   "mcpServers": {
-    // "ddg-search": {
-    //   "command": "npx",
-    //   "args": ["-y", "duckduckgo-mcp-server"],
-    //   "description": "DuckDuckGo search and content fetching capabilities."
-    // }
   }
 }
