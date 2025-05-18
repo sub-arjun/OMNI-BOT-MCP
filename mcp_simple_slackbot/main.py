@@ -15,7 +15,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
-from .llama_index_agent import LlamaIndexRAGAgent # Added LlamaIndex import
+from llama_index_agent import LlamaIndexRAGAgent # Changed from relative to direct import
 
 # Configure logging
 logging.basicConfig(
