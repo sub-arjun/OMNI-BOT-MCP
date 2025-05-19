@@ -569,20 +569,9 @@ class SlackMCPBot:
         if self.config.agent_mode == "llama_index" and self.llama_agent:
             response_text = ""
             try:
-                # Command to load a file
-                load_file_match = re.match(r"load file\s+(.+)", message_text, re.IGNORECASE)
-                if load_file_match:
-                    filename = load_file_match.group(1).strip()
-                    # Basic security: prevent path traversal. LlamaIndexAgent joins with DOCUMENTS_DIR.
-                    if ".." in filename or "/" in filename or "\\\\" in filename:
-                         response_text = "Error: Invalid filename. Please provide a filename without path components."
-                    else:
-                        logging.info(f"LlamaIndex mode: Received command to load file: {filename}")
-                        response_text = await self.llama_agent.add_file_to_index(filename)
-                else:
-                    # Regular query
-                    logging.info(f"LlamaIndex mode: Querying agent with: {message_text}")
-                    response_text = await self.llama_agent.query(message_text)
+                # Regular query
+                logging.info(f"LlamaIndex mode: Querying agent with: {message_text}")
+                response_text = await self.llama_agent.query(message_text)
                 
                 if not response_text: # Handle cases where agent might return None or empty
                     response_text = "I received your message, but I don't have a specific response for that."

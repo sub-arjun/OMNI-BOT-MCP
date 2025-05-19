@@ -51,49 +51,93 @@ class LlamaIndexRAGAgent:
         self.vector_store = DocArrayInMemoryVectorStore()
         self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
         
-        # Initialize an empty index. Documents will be added via add_file_to_index
+        # Initialize an empty index first
         self.index = VectorStoreIndex.from_documents(
-            [], # Start with no documents
+            [], 
             storage_context=self.storage_context,
         )
-        self.query_engine = self.index.as_query_engine(similarity_top_k=3) #streaming=True can be added
-        logging.info("LlamaIndexRAGAgent initialized with in-memory vector store.")
+        
+        # Load initial documents synchronously
+        self._load_documents_from_dir(DOCUMENTS_DIR)
 
-    async def add_file_to_index(self, filename: str):
+        # Create query engine after initial documents are loaded
+        self.query_engine = self.index.as_query_engine(similarity_top_k=3)
+        logging.info(f"LlamaIndexRAGAgent initialized. Query engine created. {len(self.index.docstore.docs)} documents loaded.")
+
+    def _load_documents_from_dir(self, dir_path: str):
         """
-        Adds a file to the in-memory vector index.
-        The filename is relative to the 'indexed_documents' directory.
+        Loads all documents from the specified directory into the index.
+        This is a synchronous method called during initialization.
         """
-        file_path = os.path.join(DOCUMENTS_DIR, filename)
+        if not os.path.exists(dir_path) or not os.path.isdir(dir_path):
+            logging.warning(f"Initial documents directory not found or is not a directory: {dir_path}")
+            return
+
+        loaded_count = 0
+        for filename in os.listdir(dir_path):
+            file_path = os.path.join(dir_path, filename)
+            if os.path.isfile(file_path):
+                try:
+                    logging.info(f"Loading initial document: {file_path}")
+                    reader = SimpleDirectoryReader(input_files=[file_path])
+                    documents = reader.load_data() # Synchronous call
+
+                    if not documents:
+                        logging.warning(f"No documents loaded from file: {file_path}")
+                        continue
+
+                    logging.info(f"Adding {len(documents)} document(s) from \'{filename}\' to the index during init.")
+                    for doc in documents:
+                        self.index.insert(doc) # Synchronous call
+                    loaded_count += len(documents)
+                except Exception as e:
+                    logging.error(f"Failed to load/add initial file \'{filename}\' to index: {e}")
+            else:
+                logging.info(f"Skipping non-file item in documents directory: {filename}")
+        
+        if loaded_count > 0:
+            logging.info(f"Successfully loaded {loaded_count} initial documents from {dir_path}.")
+        else:
+            logging.info(f"No initial documents found or loaded from {dir_path}.")
+
+
+    async def _add_file_to_index_by_path(self, file_path: str, filename_for_logging: str):
+        """
+        Adds a single file (given its full path) to the in-memory vector index.
+        Updates the query engine. This is an async helper.
+        """
         if not os.path.exists(file_path) or not os.path.isfile(file_path):
             logging.warning(f"File not found or is not a file: {file_path}")
-            return f"Error: File '{filename}' not found in the documents directory."
+            return f"Error: File \'{filename_for_logging}\' not found at the specified path."
 
         try:
             logging.info(f"Loading documents from: {file_path}")
-            # SimpleDirectoryReader expects a directory, or a list of files.
-            # For a single file, pass it as a list to input_files
             reader = SimpleDirectoryReader(input_files=[file_path])
-            # Run blocking I/O in a separate thread
             documents = await asyncio.to_thread(reader.load_data)
 
             if not documents:
                 logging.warning(f"No documents loaded from file: {file_path}")
-                return f"Warning: No documents could be loaded from '{filename}'."
+                return f"Warning: No documents could be loaded from \'{filename_for_logging}\'."
 
-            logging.info(f"Adding {len(documents)} document(s) from '{filename}' to the index.")
+            logging.info(f"Adding {len(documents)} document(s) from \'{filename_for_logging}\' to the index.")
             for doc in documents:
-                # Run blocking index insertion in a separate thread
                 await asyncio.to_thread(self.index.insert, doc)
-
-            # Re-create the query engine to reflect the updated index
-            # Run blocking operation in a separate thread
+            
             self.query_engine = await asyncio.to_thread(self.index.as_query_engine, similarity_top_k=3)
-            logging.info(f"Successfully added '{filename}' to index and updated query engine.")
-            return f"Successfully added '{filename}' to the knowledge base."
+            logging.info(f"Successfully added \'{filename_for_logging}\' to index and updated query engine.")
+            return f"Successfully added \'{filename_for_logging}\' to the knowledge base."
         except Exception as e:
-            logging.error(f"Failed to add file '{filename}' to index: {e}")
-            return f"Error processing file '{filename}': {e}"
+            logging.error(f"Failed to add file \'{filename_for_logging}\' to index: {e}")
+            return f"Error processing file \'{filename_for_logging}\': {e}"
+
+    async def add_file_to_index(self, filename: str):
+        """
+        Adds a file to the in-memory vector index.
+        The filename is relative to the \'indexed_documents\' directory.
+        This method is intended for dynamic additions post-initialization.
+        """
+        file_path = os.path.join(DOCUMENTS_DIR, filename)
+        return await self._add_file_to_index_by_path(file_path, filename)
 
     async def query(self, user_query: str):
         """
